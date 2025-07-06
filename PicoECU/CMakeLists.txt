@@ -35,7 +35,7 @@ pico_sdk_init()
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(PicoECU PicoECU.c )
+add_executable(PicoECU PicoECU.c ssd1306/ssd1306.c)
 
 pico_set_program_name(PicoECU "PicoECU")
 pico_set_program_version(PicoECU "0.1")
@@ -50,7 +50,7 @@ target_link_libraries(PicoECU
 
 # Add the standard include files to the build
 target_include_directories(PicoECU PRIVATE
-        ${CMAKE_CURRENT_LIST_DIR}
+        ${CMAKE_CURRENT_LIST_DIR}/ssd1306
 )
 
 # Add any user requested libraries
@@ -59,6 +59,7 @@ target_link_libraries(PicoECU
         hardware_dma
         hardware_timer
         hardware_clocks
+        hardware_adc
         )
 
 pico_add_extra_outputs(PicoECU)
