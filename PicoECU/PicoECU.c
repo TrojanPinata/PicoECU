@@ -13,13 +13,16 @@
 #define I2C_SCL     1
 
 #define INJECTOR_PIN    21
-#define HALL_PIN        26 
+#define HALL_PIN        20 
 #define ADC_MAP_PIN     27 
 #define ADC_TEMP_PIN    28 
+#define ADC_KNOB_PIN    26
 
-//#define ADC_HALL_CHANNEL    0
+#define ADC_KNOB_CHANNEL    0
 #define ADC_MAP_CHANNEL     1 
 #define ADC_TEMP_CHANNEL    2 
+#define NUM_CHANNELS        3
+#define DMA_BUFFER_SIZE     256
 
 #define HALL_THRESH     2500
 #define HYSTERESIS      200
@@ -35,18 +38,25 @@
 volatile uint32_t rpm = 0;
 volatile uint32_t rpm_max = 0;
 volatile uint16_t map = 0;
+volatile float afr_knob = 1.0f;
 volatile float injector_us = 0;
 volatile float temp_c = 25.0;
 absolute_time_t last_cycle_time;
 volatile bool prev_state = false;
+int dma_chan;
 
 ssd1306_t disp;
+
+uint16_t adc_dma_buffer[DMA_BUFFER_SIZE];
 
 // prototypes
 void prep_injector();
 void injector_pulse(float pulse_us);
 void display_info();
-float get_temp();
+void dma_irq_handle();
+void hall_effect_sensor_callback(uint gpio, uint32_t events);
+void process_adc_dma_data();
+void dma_irq_handle();
 
 
 // fire injector for pulse_us - PWM for 
@@ -54,20 +64,6 @@ void injector_pulse(float pulse_us) {
     gpio_put(INJECTOR_PIN, 1);
     sleep_us((int)pulse_us);
     gpio_put(INJECTOR_PIN, 0);
-}
-
-// don't worry about the math here, basically just find the voltage based on the ADC values and convert to a resistance
-// resistance can then be used to either look up or calculate (Steinhart–Hart equation thingy) the resulting temp in kelvin and then to celsius
-float get_temp() {
-    adc_select_input(ADC_TEMP_CHANNEL);
-    uint16_t temp_raw = adc_read();
-
-    // float thermistor_resistance = (3.3f * 10000 / (temp_raw * 3.3f / 4095.0f)) - 10000;
-    // resistance = (adc_voltage * fixed_resistor) / (supply_voltage - adc_voltage)
-    float divider_voltage = (temp_raw / 4095.0f) * 3.3f;
-    float thermistor_resistance = (divider_voltage * 10000) / (3.3f - divider_voltage);
-    float temp_kelvin = 1.0f / (1.0f / 298.15f + log(thermistor_resistance / TEMP_ROOM_RES) / TEMP_BETA);
-    return temp_kelvin - 273.15f;
 }
 
 // display sensor info on oled
@@ -93,17 +89,24 @@ void display_info() {
     ssd1306_show(&disp);
 }
 
+void get_afr_knob_value() {
+
+}
+
 void prep_injector() {
-    adc_select_input(ADC_MAP_CHANNEL);
-    map = adc_read();
     bool intake = (map < INTAKE_THRESH);
 
     if (intake) {
         // determine fuel amount
-        float fuel_modifier = 1.0f;
+        float fuel_modifier = 0.9f; // rich
         if (temp_c < 20.0f) {
             fuel_modifier = COLD_RATIO; 
         }
+        else {
+            fuel_modifier = 1.0f;
+        }
+
+        fuel_modifier = fuel_modifier * afr_knob;
 
         float base_pulse_us = 1000 + (700 - map) * 2;   // i am using this because i have no idea what the real equation is
         injector_us = base_pulse_us * fuel_modifier;
@@ -132,12 +135,65 @@ void hall_effect_sensor_callback(uint gpio, uint32_t events) {
     }
 }
 
+void process_adc_dma_data() {
+    for (int i = DMA_BUFFER_SIZE - NUM_CHANNELS; i >= 0; i -= NUM_CHANNELS) {
+        uint16_t afr_knob_raw = adc_dma_buffer[i];
+        map = adc_dma_buffer[i + 1];
+        uint16_t temp_raw = adc_dma_buffer[i + 2];
+
+        // don't worry about the math here, basically just find the voltage based on the ADC values and convert to a resistance
+        // resistance can then be used to either look up or calculate (Steinhart–Hart equation thingy) the resulting temp in kelvin and then to celsius
+        float divider_voltage = (temp_raw / 4095.0f) * 3.3f;
+        float thermistor_resistance = (divider_voltage * 10000) / (3.3f - divider_voltage);
+        float temp_kelvin = 1.0f / (1.0f / 298.15f + log(thermistor_resistance / TEMP_ROOM_RES) / TEMP_BETA);
+        temp_c = temp_kelvin - 273.15f;
+
+        // math for normalizing fuel ratio modifier - lower value is richer, meaning turn left for rich and right for lean
+        afr_knob = ((float)afr_knob_raw * 2.0f) / 4096.0f;
+        break; 
+    }
+}
+
+void dma_irq_handler() {
+    dma_hw->ints0 = 1u << dma_chan; 
+    dma_channel_set_read_addr(dma_chan, &adc_hw->fifo, false);
+    dma_channel_set_trans_count(dma_chan, DMA_BUFFER_SIZE, true);
+    process_adc_dma_data(); 
+}
+
 int main() {
     stdio_init_all();
 
     adc_init();
-    adc_gpio_init(ADC_MAP_PIN);
-    adc_gpio_init(ADC_TEMP_PIN);
+    adc_set_round_robin((1 << ADC_KNOB_CHANNEL) | (1 << ADC_MAP_CHANNEL) | (1 << ADC_TEMP_CHANNEL));
+    adc_fifo_setup(
+        true,           // FIFO
+        true,           // DREQ
+        NUM_CHANNELS,   // 2 channels
+        false,          // no error bits
+        false           // no byte shift
+    );
+    adc_run(true);
+
+    dma_chan = dma_claim_unused_channel(true);
+    dma_channel_config cfg = dma_channel_get_default_config(dma_chan);
+    channel_config_set_transfer_data_size(&cfg, DMA_SIZE_16);
+    channel_config_set_read_increment(&cfg, false); 
+    channel_config_set_write_increment(&cfg, true); 
+    channel_config_set_dreq(&cfg, DREQ_ADC);
+
+    dma_channel_configure(
+        dma_chan,
+        &cfg,
+        adc_dma_buffer,  
+        &adc_hw->fifo,   
+        DMA_BUFFER_SIZE, 
+        true             
+    );
+
+    dma_channel_set_irq0_enabled(dma_chan, true);
+    irq_set_exclusive_handler(DMA_IRQ_0, dma_irq_handler);
+    irq_set_enabled(DMA_IRQ_0, true);
 
     gpio_init(HALL_PIN);
     gpio_set_dir(HALL_PIN, GPIO_IN);
