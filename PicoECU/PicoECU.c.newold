@@ -15,24 +15,21 @@
 #define INJECTOR_PIN    21
 #define HALL_PIN        20 
 #define ADC_MAP_PIN     27 
-#define ADC_TEMP_PIN    28 
 #define ADC_KNOB_PIN    26
 
 #define ADC_KNOB_CHANNEL    0
 #define ADC_MAP_CHANNEL     1 
-#define ADC_TEMP_CHANNEL    2 
 #define NUM_CHANNELS        2
-#define DMA_BUFFER_SIZE     256
+#define DMA_BUFFER_SIZE     256   // multiple of NUM_CHANNELS
+#define SAMPLES_PER_CHANNEL (DMA_BUFFER_SIZE / NUM_CHANNELS)
 
 #define HALL_THRESH     2500
 #define HYSTERESIS      200
-#define TEMP_BETA       3950
-#define TEMP_ROOM_RES   10000
 #define COLD_RATIO      1.3f
-#define INTAKE_THRESH   650
+#define INTAKE_THRESH   600
 #define INJ_DUR_MAX     5000
 #define INJ_DUR_MIN     500
-#define CYCLE_DELAY     10     // 30 gives a max rpm of ~20k. we can only dream.
+#define CYCLE_DELAY     10
 #define MIN_CYCLE       300
 
 volatile uint32_t rpm = 0;
@@ -40,28 +37,23 @@ volatile uint32_t rpm_max = 0;
 volatile uint16_t map = 0;
 volatile float afr_knob = 1.0f;
 volatile float injector_us = 0;
-volatile float temp_c = 25.0;
 absolute_time_t last_cycle_time;
 volatile bool prev_state = false;
 int dma_chan;
-
-volatile bool injector_trigger = false;
+bool adc_buf_ready = false;
 
 ssd1306_t disp;
-
 uint16_t adc_dma_buffer[DMA_BUFFER_SIZE];
 
 // prototypes
 void prep_injector();
 void injector_pulse(float pulse_us);
 void display_info();
-void dma_irq_handle();
+void dma_irq_handler();
 void hall_effect_sensor_callback(uint gpio, uint32_t events);
 void process_adc_dma_data();
-void dma_irq_handle();
 
-
-// fire injector for pulse_us - PWM for 
+// fire injector
 void injector_pulse(float pulse_us) {
     gpio_put(INJECTOR_PIN, 1);
     sleep_us((int)pulse_us);
@@ -82,42 +74,25 @@ void display_info() {
     snprintf(display_buffer, sizeof(display_buffer), "Injector PW: %.2fus", injector_us);
     ssd1306_draw_string(&disp, 0, 28, 1, display_buffer);
 
-    snprintf(display_buffer, sizeof(display_buffer), "Knob: %.4f", afr_knob);
+    snprintf(display_buffer, sizeof(display_buffer), "AFR_KNOB: %.4f", afr_knob);
     ssd1306_draw_string(&disp, 0, 40, 1, display_buffer);
 
-    snprintf(display_buffer, sizeof(display_buffer), "Peak RPM: %5u", rpm_max);
-    ssd1306_draw_string(&disp, 0, 52, 1, display_buffer);
-
     ssd1306_show(&disp);
-}
-
-void get_afr_knob_value() {
-
 }
 
 void prep_injector() {
     bool intake = (map < INTAKE_THRESH);
 
     if (intake) {
-        // determine fuel amount
-        float fuel_modifier = 0.9f; // rich
-        if (temp_c < 20.0f) {
-            fuel_modifier = COLD_RATIO; 
-        }
-        else {
-            fuel_modifier = 1.0f;
-        }
+        float fuel_modifier = 1.0f; // simplified (no temp correction)
+        fuel_modifier *= afr_knob;
 
-        fuel_modifier = fuel_modifier * afr_knob;
-
-        float base_pulse_us = 1000 + (700 - map) * 2;   // i am using this because i have no idea what the real equation is
+        float base_pulse_us = 1000 + (700 - map) * 2;
         injector_us = base_pulse_us * fuel_modifier;
 
-        // set injection duration limits
         if (injector_us > INJ_DUR_MAX) {
             injector_us = INJ_DUR_MAX;
-        }
-        else if (injector_us < INJ_DUR_MIN) {
+        } else if (injector_us < INJ_DUR_MIN) {
             injector_us = INJ_DUR_MIN;
         }
 
@@ -133,44 +108,55 @@ void hall_effect_sensor_callback(uint gpio, uint32_t events) {
         rpm = 60000000 / dt;
         if (rpm > rpm_max) rpm_max = rpm;
         last_time = now;
-        injector_trigger = true;
+        prep_injector();
     }
 }
 
 void process_adc_dma_data() {
-    for (int i = DMA_BUFFER_SIZE - NUM_CHANNELS; i >= 0; i -= NUM_CHANNELS) {
-        uint16_t afr_knob_raw = adc_dma_buffer[i];
-        map = adc_dma_buffer[i + 1];
+    uint32_t knob_sum = 0;
+    uint32_t map_sum  = 0;
+    uint32_t knob_count = 0, map_count = 0;
 
-        // math for normalizing fuel ratio modifier - lower value is richer, meaning turn left for rich and right for lean
-        afr_knob = ((float)afr_knob_raw * 2.0f) / 4096.0f;
-        break; 
+    for (int i = 0; i < DMA_BUFFER_SIZE; i++) {
+        uint16_t sample  = adc_dma_buffer[i] & 0x0FFF; 
+        uint8_t channel  = (adc_dma_buffer[i] >> 12) & 0xF;
+
+        switch (channel) {
+            case ADC_KNOB_CHANNEL: knob_sum += sample; knob_count++; break;
+            case ADC_MAP_CHANNEL:  map_sum  += sample; map_count++;  break;
+        }
     }
+
+    uint16_t knob_raw_avg = knob_count ? (knob_sum / knob_count) : 0;
+    uint16_t map_raw_avg  = map_count  ? (map_sum  / map_count)  : 0;
+
+    map = map_raw_avg;
+    afr_knob = (knob_raw_avg / 4095.0f) * 2.0f;
 }
 
 void dma_irq_handler() {
     dma_hw->ints0 = 1u << dma_chan; 
-    //dma_channel_set_read_addr(dma_chan, &adc_hw->fifo, false);
-    //dma_channel_set_read_addr(dma_chan, adc_dma_buffer, false);
-    dma_channel_set_write_addr(dma_chan, adc_dma_buffer, false);
-    dma_channel_set_trans_count(dma_chan, DMA_BUFFER_SIZE, true);
-    process_adc_dma_data(); 
+    adc_buf_ready = true;
 }
 
 int main() {
     stdio_init_all();
+    sleep_ms(1000);
+    printf("starting...\n");
 
     adc_init();
     adc_gpio_init(ADC_KNOB_PIN);
     adc_gpio_init(ADC_MAP_PIN);
     adc_set_round_robin((1 << ADC_KNOB_CHANNEL) | (1 << ADC_MAP_CHANNEL));
     adc_fifo_setup(
-        true,           // FIFO
-        true,           // DREQ
-        NUM_CHANNELS,   // 2 channels
-        false,          // no error bits
-        false           // no byte shift
+        true,   // enable FIFO
+        true,   // enable DMA/DREQ
+        1,      // DREQ threshold
+        false,  // no error bits
+        true    // enable channel tag
     );
+    adc_set_clkdiv(480);
+    adc_fifo_drain();
     adc_run(true);
 
     dma_chan = dma_claim_unused_channel(true);
@@ -193,6 +179,8 @@ int main() {
     irq_set_exclusive_handler(DMA_IRQ_0, dma_irq_handler);
     irq_set_enabled(DMA_IRQ_0, true);
 
+    printf("dma configured...\n");
+
     gpio_init(HALL_PIN);
     gpio_set_dir(HALL_PIN, GPIO_IN);
     gpio_set_irq_enabled_with_callback(HALL_PIN, GPIO_IRQ_EDGE_FALL, true, hall_effect_sensor_callback);
@@ -202,22 +190,32 @@ int main() {
     gpio_put(INJECTOR_PIN, 0);
 
     i2c_init(I2C_PORT, 400*1000);
-    
     gpio_set_function(I2C_SDA, GPIO_FUNC_I2C);
     gpio_set_function(I2C_SCL, GPIO_FUNC_I2C);
     gpio_pull_up(I2C_SDA);
     gpio_pull_up(I2C_SCL);
 
+    printf("pins setup...\n");
+
+    for (int addr = 0; addr < 128; addr++) {
+        if (!i2c_write_blocking(i2c0, addr, NULL, 0, true)) {
+            printf("Found I2C device at 0x%02X\n", addr);
+        }
+    }
+
     disp.external_vcc = false;
     ssd1306_init(&disp, 128, 64, 0x3C, I2C_PORT);
+    printf("screen initialized...\n");
 
     last_cycle_time = get_absolute_time();
 
     while (true) {
         display_info();
-        if (injector_trigger) {
-            prep_injector();
-            injector_trigger = false;
+        if (adc_buf_ready) {
+            process_adc_dma_data();
+            dma_channel_set_write_addr(dma_chan, adc_dma_buffer, false);
+            dma_channel_set_trans_count(dma_chan, DMA_BUFFER_SIZE, true);
+            adc_buf_ready = false;
         }
         sleep_ms(CYCLE_DELAY); 
     }

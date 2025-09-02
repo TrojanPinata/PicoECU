@@ -54,7 +54,8 @@ target_include_directories(PicoECU PRIVATE
 )
 
 # Add any user requested libraries
-target_link_libraries(PicoECU 
+target_link_libraries(PicoECU
+        pico_stdlib
         hardware_i2c
         hardware_dma
         hardware_timer
